@@ -1,6 +1,7 @@
 // Telegram MTProto proxy bot — standalone (Railway-ready)
-// Collects proxies from public channels/APIs, TCP-tests them, and posts working ones every 5 minutes.
+// Collects proxies from public channels/APIs, tests them properly, and posts working ones.
 import net from "node:net";
+import tls from "node:tls";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
 // ---- Config (via environment variables) ----
@@ -8,10 +9,9 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const CHANNEL = process.env.CHANNEL || "@Telgram_proxy963";
 const INTERVAL_MIN = Number(process.env.INTERVAL_MIN || "5");
 const MAX_POST = Number(process.env.MAX_POST || "6");
-const TCP_TIMEOUT = 4000;
+const TCP_TIMEOUT = 5000;
 const POSTED_FILE = "/tmp/posted.json";
 
-// Source channels (public) and APIs. Edit freely.
 const SOURCE_CHANNELS = (process.env.SOURCE_CHANNELS ||
   "iRoProxy,ProxyMTProto,MTProxyT,iporoxy1")
   .split(",")
@@ -31,7 +31,7 @@ if (!BOT_TOKEN) {
 type Proxy = { server: string; port: number; secret: string };
 const key = (p: Proxy) => `${p.server}:${p.port}`;
 
-function extractProxies(text: string): Proxy[] {
+function extractProxies(text: string, maxCount = 10): Proxy[] {
   const out: Proxy[] = [];
   const re = /(?:t\.me\/proxy|tg:\/\/proxy)\?([^"'\s<)\]]+)/gi;
   let m;
@@ -42,7 +42,8 @@ function extractProxies(text: string): Proxy[] {
     const secret = params.get("secret") || "";
     if (server && port && secret) out.push({ server, port, secret });
   }
-  return out;
+  // Return only the LAST N (most recent) proxies from each source
+  return out.slice(-maxCount);
 }
 
 async function fetchText(url: string): Promise<string> {
@@ -59,9 +60,11 @@ async function fetchText(url: string): Promise<string> {
 
 async function collect(): Promise<Proxy[]> {
   const all: Proxy[] = [];
-  const chTasks = SOURCE_CHANNELS.map(async (ch) =>
-    extractProxies(await fetchText(`https://t.me/s/${ch}`)),
-  );
+  const chTasks = SOURCE_CHANNELS.map(async (ch) => {
+    const html = await fetchText(`https://t.me/s/${ch}`);
+    // Only take last 8 proxies per channel (freshest)
+    return extractProxies(html, 8);
+  });
   const apiTasks = SOURCE_APIS.map(async (url) => {
     const body = await fetchText(url);
     try {
@@ -69,13 +72,14 @@ async function collect(): Promise<Proxy[]> {
       if (Array.isArray(data))
         return data
           .filter((x: any) => x.host && x.port && x.secret)
+          .slice(-10)
           .map((x: any) => ({
             server: String(x.host),
             port: Number(x.port),
             secret: String(x.secret),
           }));
     } catch {}
-    return extractProxies(body);
+    return extractProxies(body, 10);
   });
   for (const list of await Promise.all([...chTasks, ...apiTasks]))
     all.push(...list);
@@ -83,20 +87,53 @@ async function collect(): Promise<Proxy[]> {
   return all.filter((p) => (seen.has(key(p)) ? false : (seen.add(key(p)), true)));
 }
 
-function tcpAlive(host: string, port: number): Promise<number | null> {
+// Real proxy test: for fake-TLS proxies (secret starts with ee/dd), do TLS handshake
+// For others, do TCP + send bytes and check response
+function testProxy(p: Proxy): Promise<number | null> {
+  const isFakeTLS = p.secret.toLowerCase().startsWith("ee") || p.secret.toLowerCase().startsWith("dd");
+
   return new Promise((resolve) => {
     const start = Date.now();
-    const sock = net.connect({ host, port, timeout: TCP_TIMEOUT });
-    sock.on("connect", () => {
-      sock.destroy();
-      resolve(Date.now() - start);
-    });
-    const fail = () => {
-      sock.destroy();
-      resolve(null);
-    };
-    sock.on("error", fail);
-    sock.on("timeout", fail);
+    const timeout = TCP_TIMEOUT;
+
+    if (isFakeTLS) {
+      // Fake-TLS proxy: try TLS connection (these proxies speak TLS)
+      const sock = tls.connect(
+        { host: p.server, port: p.port, timeout, rejectUnauthorized: false },
+        () => {
+          // TLS handshake succeeded — proxy is alive and responding
+          const ms = Date.now() - start;
+          sock.destroy();
+          resolve(ms);
+        }
+      );
+      const fail = () => { sock.destroy(); resolve(null); };
+      sock.on("error", fail);
+      sock.on("timeout", fail);
+      setTimeout(() => fail(), timeout);
+    } else {
+      // Regular MTProto: TCP connect + send a small payload to check response
+      const sock = net.connect({ host: p.server, port: p.port, timeout });
+      sock.on("connect", () => {
+        // Send a dummy handshake byte to see if we get a response
+        sock.write(Buffer.from([0xef]));
+        const dataTimer = setTimeout(() => {
+          // No response in 2s after connect — likely dead
+          sock.destroy();
+          resolve(null);
+        }, 2000);
+        sock.once("data", () => {
+          clearTimeout(dataTimer);
+          const ms = Date.now() - start;
+          sock.destroy();
+          resolve(ms);
+        });
+      });
+      const fail = () => { sock.destroy(); resolve(null); };
+      sock.on("error", fail);
+      sock.on("timeout", fail);
+      setTimeout(() => fail(), timeout);
+    }
   });
 }
 
@@ -118,23 +155,36 @@ async function runOnce() {
       (p) => !posted[key(p)] || now - posted[key(p)] > COOLDOWN,
     );
 
+    console.log(`[${new Date().toISOString()}] collected=${proxies.length} fresh=${fresh.length}`);
+
     const alive: { p: Proxy; ms: number }[] = [];
-    const batch = 20;
+    const batch = 10;
     for (let i = 0; i < fresh.length && alive.length < MAX_POST * 3; i += batch) {
       const res = await Promise.all(
         fresh.slice(i, i + batch).map(async (p) => ({
           p,
-          ms: await tcpAlive(p.server, p.port),
+          ms: await testProxy(p),
         })),
       );
-      for (const r of res) if (r.ms !== null) alive.push(r as any);
+      for (const r of res) {
+        if (r.ms !== null) {
+          console.log(`  ✓ ${r.p.server}:${r.p.port} — ${r.ms}ms`);
+          alive.push(r as any);
+        } else {
+          console.log(`  ✗ ${r.p.server}:${r.p.port} — dead`);
+        }
+      }
     }
+
+    // Sort by ping, best first
     alive.sort((a, b) => a.ms - b.ms);
     const toPost = alive.slice(0, MAX_POST);
-    console.log(
-      `[${new Date().toISOString()}] collected=${proxies.length} fresh=${fresh.length} alive=${alive.length} posting=${toPost.length}`,
-    );
-    if (toPost.length === 0) return;
+    console.log(`  alive=${alive.length} posting=${toPost.length}`);
+
+    if (toPost.length === 0) {
+      console.log("⚠️ No working proxies found this round.");
+      return;
+    }
 
     const timeStr = new Date().toLocaleString("fa-IR", {
       timeZone: "Asia/Tehran",
