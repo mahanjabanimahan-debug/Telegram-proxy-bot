@@ -127,12 +127,9 @@ async function collect(): Promise<Proxy[]> {
   });
 }
 
-// Real proxy test
+// Real proxy test — TCP connect is enough to confirm the server is alive
+// MTProto proxies don't respond to random data, so we just check connectivity
 function testProxy(p: Proxy): Promise<number | null> {
-  const isFakeTLS =
-    p.secret.toLowerCase().startsWith("ee") ||
-    p.secret.toLowerCase().startsWith("dd");
-
   return new Promise((resolve) => {
     const start = Date.now();
     let resolved = false;
@@ -142,53 +139,18 @@ function testProxy(p: Proxy): Promise<number | null> {
       resolve(ms);
     };
 
-    // Hard timeout
     const hardTimer = setTimeout(() => done(null), TCP_TIMEOUT + 1000);
 
-    if (isFakeTLS) {
-      // Fake-TLS: do TLS handshake
-      const sock = tls.connect(
-        { host: p.server, port: p.port, timeout: TCP_TIMEOUT, rejectUnauthorized: false },
-        () => {
-          clearTimeout(hardTimer);
-          done(Date.now() - start);
-          sock.destroy();
-        }
-      );
-      sock.on("error", () => { clearTimeout(hardTimer); done(null); sock.destroy(); });
-      sock.on("timeout", () => { clearTimeout(hardTimer); done(null); sock.destroy(); });
-    } else if (p.port === 443) {
-      // Port 443 non-fake-TLS: try TLS first
-      const sock = tls.connect(
-        { host: p.server, port: p.port, timeout: TCP_TIMEOUT, rejectUnauthorized: false },
-        () => {
-          clearTimeout(hardTimer);
-          done(Date.now() - start);
-          sock.destroy();
-        }
-      );
-      sock.on("error", () => { clearTimeout(hardTimer); done(null); sock.destroy(); });
-      sock.on("timeout", () => { clearTimeout(hardTimer); done(null); sock.destroy(); });
-    } else {
-      // Regular: TCP connect + send bytes + wait for response
-      const sock = net.connect({ host: p.server, port: p.port, timeout: TCP_TIMEOUT });
-      sock.on("connect", () => {
-        sock.write(Buffer.from([0xef]));
-        const dataTimer = setTimeout(() => {
-          clearTimeout(hardTimer);
-          done(null);
-          sock.destroy();
-        }, 3000);
-        sock.once("data", () => {
-          clearTimeout(dataTimer);
-          clearTimeout(hardTimer);
-          done(Date.now() - start);
-          sock.destroy();
-        });
-      });
-      sock.on("error", () => { clearTimeout(hardTimer); done(null); sock.destroy(); });
-      sock.on("timeout", () => { clearTimeout(hardTimer); done(null); sock.destroy(); });
-    }
+    // For all proxy types: TCP connect test is the most reliable
+    // TLS handshake fails on many working proxies because they use custom TLS
+    const sock = net.connect({ host: p.server, port: p.port, timeout: TCP_TIMEOUT });
+    sock.on("connect", () => {
+      clearTimeout(hardTimer);
+      done(Date.now() - start);
+      sock.destroy();
+    });
+    sock.on("error", () => { clearTimeout(hardTimer); done(null); sock.destroy(); });
+    sock.on("timeout", () => { clearTimeout(hardTimer); done(null); sock.destroy(); });
   });
 }
 
