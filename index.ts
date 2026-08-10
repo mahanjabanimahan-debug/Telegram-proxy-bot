@@ -252,7 +252,7 @@ async function runOnce() {
       minute: "2-digit",
     });
     const lines = toPost.map(
-      (x, i) => `🔹 پروکسی ${i + 1} — پینگ ${x.ms}ms (از ${x.p.source})`,
+      (x, i) => `🔹 پروکسی ${i + 1} — پینگ ${x.ms}ms`,
     );
     const text = `⚡️ پروکسی‌های فعال تلگرام\n🕐 ${timeStr}\n\n${lines.join(
       "\n",
