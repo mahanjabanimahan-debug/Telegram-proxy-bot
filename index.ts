@@ -60,47 +60,23 @@ async function fetchText(url: string): Promise<string> {
   }
 }
 
-// Extract proxies from ONLY the last few messages that contain proxy links
+// Extract proxies from the page — take the last N unique proxies (most recent posts)
 function extractFromLastMessages(html: string, channelName: string): Proxy[] {
-  // Split by message containers — each message has data-post="channel/id"
-  const msgPattern = /class="tgme_widget_message_wrap[^"]*"[\s\S]*?data-post="[^"]*"[\s\S]*?(?=class="tgme_widget_message_wrap|$)/gi;
-  const messages: string[] = [];
-  let match;
-  while ((match = msgPattern.exec(html))) {
-    messages.push(match[0]);
-  }
+  const all = extractProxiesFromText(html);
 
-  // If regex didn't work well, try simpler split
-  if (messages.length === 0) {
-    const parts = html.split('tgme_widget_message_wrap');
-    for (const part of parts) {
-      if (part.includes('t.me/proxy') || part.includes('tg://proxy')) {
-        messages.push(part);
-      }
+  // Deduplicate keeping order
+  const seen = new Set<string>();
+  const unique: Proxy[] = [];
+  for (const p of all) {
+    const k = `${p.server}:${p.port}:${p.secret}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      unique.push({ ...p, source: channelName });
     }
   }
 
-  // Go from the end, find messages with proxy links
-  const result: Proxy[] = [];
-  for (let i = messages.length - 1; i >= 0 && result.length === 0; i--) {
-    const proxies = extractProxiesFromText(messages[i]);
-    if (proxies.length > 0) {
-      for (const p of proxies) {
-        result.push({ ...p, source: channelName });
-      }
-    }
-  }
-
-  // Fallback: if we couldn't parse messages, just take last 3 unique proxies from whole page
-  if (result.length === 0) {
-    const all = extractProxiesFromText(html);
-    const last3 = all.slice(-3);
-    for (const p of last3) {
-      result.push({ ...p, source: channelName });
-    }
-  }
-
-  return result;
+  // Take the last 10 unique proxies (from the most recent messages)
+  return unique.slice(-10);
 }
 
 async function collect(): Promise<Proxy[]> {
